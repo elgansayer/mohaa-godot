@@ -334,7 +334,7 @@ func _on_search_completed(result: int, response_code: int,
 		_fail("API unreachable after %d retries (result %d)%s" % [MAX_RETRIES, result, hint])
 		return
 
-	if response_code == 0 and OS.has_feature("web"):
+	if response_code == 0 and result == HTTPRequest.RESULT_SUCCESS and OS.has_feature("web"):
 		# On web, a response_code of 0 with RESULT_SUCCESS can indicate
 		# a CORS-blocked preflight (browser returns empty response).
 		_fail("moh-db.com request blocked (Web: likely a CORS policy issue)")
