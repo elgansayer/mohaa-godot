@@ -20,6 +20,18 @@
 ##
 ## The system works with any server — no server-side changes required.
 ##
+## Engine VFS notes (OpenMoHAA — NOT vanilla Quake 3):
+##   - The engine discovers pk3 files in the game directory (e.g. main/)
+##     during FS_Startup / FS_Restart.  It does NOT scan subdirectories
+##     for pk3 files, but it DOES support .pk3dir directories (loose-file
+##     directories treated as virtual pk3 archives in the search path).
+##   - For non-pure servers (sv_pure=0, the OpenMoHAA default), reconnecting
+##     triggers FS_Restart directly (CA_CONNECTED + empty sv_paks path in
+##     CL_ParseGamestate).
+##   - For pure servers (sv_pure=1), FS_ConditionalRestart is used, which
+##     only restarts if the checksumFeed or fs_game changed.  We handle
+##     this by toggling fs_game before reconnecting.
+##
 ## moh-db.com API (see https://www.moh-db.com/api-docs):
 ##   GET /api/maps?search=<name>  → search for map files
 ##   Response contains download URLs and file metadata.
@@ -507,6 +519,19 @@ func _install_and_reconnect(file_hash: String) -> void:
 
 
 ## Common completion logic after successful install.
+##
+## The reconnect flow relies on the engine's FS_Restart mechanism:
+##   reconnect → connect <server> → server sends gamestate
+##   → CL_ParseGamestate() → FS_ConditionalRestart() or FS_Restart()
+##
+## For non-pure servers (sv_pure=0, the OpenMoHAA default), the engine
+## takes the CA_CONNECTED + empty sv_paks path which calls FS_Restart()
+## directly — guaranteed to pick up the new pk3 file.
+##
+## For pure servers (sv_pure=1), FS_ConditionalRestart() only restarts
+## if the checksumFeed changed.  To handle both cases reliably, we
+## toggle fs_game briefly to force the modified flag, ensuring
+## FS_ConditionalRestart() always triggers Com_GameRestart().
 func _finish_install() -> void:
 	var map_name := _current_map_name
 	_show_ui_reconnecting()
@@ -518,6 +543,18 @@ func _finish_install() -> void:
 	_busy = false
 	_hide_ui()
 	if _runner and _runner.has_method("execute_command"):
+		# Force FS_Restart on reconnect for pure servers (sv_pure=1):
+		# Toggle fs_game to set the ->modified flag so that
+		# FS_ConditionalRestart() triggers a full Com_GameRestart().
+		# For non-pure servers (OpenMoHAA default) this is redundant
+		# but harmless — FS_Restart is already guaranteed.
+		var current_fs_game := ""
+		if _runner.has_method("get_cvar_string"):
+			current_fs_game = _runner.get_cvar_string("fs_game")
+		if current_fs_game != "":
+			# Set to a dummy value then back to force the modified flag.
+			_runner.execute_command("set fs_game _reload_temp")
+			_runner.execute_command("set fs_game " + current_fs_game)
 		_runner.execute_command("reconnect")
 		print("MapDownloader: Sent 'reconnect' command.")
 

@@ -8,6 +8,12 @@
 ## map (same hash), it is stored only once.  Per-server isolation is handled
 ## by ServerSessionManager, not here.
 ##
+## OpenMoHAA VFS note: pk3 files must be placed in the top-level game
+## directory (e.g. main/).  The engine does NOT recurse into subdirectories
+## to find pk3 files (it only scans top-level .pk3 and .pk3dir entries
+## during FS_AddGameDirectory).  Files are installed via install_to_game_dir()
+## which copies them to the game directory root.
+##
 ## Usage (autoload singleton "CacheManager"):
 ##   CacheManager.has_file(sha256_hex)         -> bool
 ##   CacheManager.get_cached_path(sha256_hex)   -> String
