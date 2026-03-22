@@ -308,7 +308,7 @@ func _on_search_completed(result: int, response_code: int,
 			results = parsed["results"]
 
 	if results.is_empty():
-		_fail("Map '%s' not found on moh-db.com" % _current_map_name)
+		_fail("Map '%s' not found on moh-db.com" % _current_map_name, true)
 		return
 
 	# Pick the best match.  Prefer an entry whose name matches exactly.
@@ -335,7 +335,7 @@ func _on_search_completed(result: int, response_code: int,
 			download_url = API_BASE_URL + "/maps/" + str(entry_id) + "/download"
 
 	if download_url == "":
-		_fail("No download URL found for '%s'" % _current_map_name)
+		_fail("No download URL found for '%s'" % _current_map_name, true)
 		return
 
 	var file_name: String = best.get("file_name",
@@ -591,16 +591,12 @@ func _finish_install() -> void:
 # Failure
 # ---------------------------------------------------------------------------
 
-func _fail(reason: String) -> void:
+func _fail(reason: String, is_not_found: bool = false) -> void:
 	_busy = false
 	_downloading = false
 	_cleanup_temp()
 	push_warning("MapDownloader: FAILED — ", reason)
 
-	# Determine if this is a "map not found" error vs a network/download error.
-	var is_not_found := reason.contains("not found on moh-db.com") or \
-		reason.contains("No download URL") or \
-		reason.contains("not found on")
 	_show_ui_error(reason, is_not_found)
 	download_failed.emit(_current_map_name, reason)
 
