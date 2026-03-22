@@ -48,6 +48,45 @@
 ## moh-db.com API (see https://www.moh-db.com/api-docs):
 ##   GET /api/maps?search=<name>  → search for map files
 ##   Response contains download URLs and file metadata.
+##
+## Platform evaluation:
+##
+##   Web (Emscripten/WASM):
+##     ✅ Threading: HTTP requests use async mode (use_threads=false).
+##     ✅ Storage: user:// maps to IndexedDB via Emscripten's IDBFS.
+##     ✅ VFS: game directory is in Emscripten MEMFS; FS_Restart works.
+##     ⚠️  CORS: moh-db.com must serve Access-Control-Allow-Origin headers.
+##        If CORS blocks the request, a platform-specific error is shown.
+##     ⚠️  Storage quota: browsers limit IndexedDB (~50-100 MB default).
+##        Large pk3 files may hit quota limits. Cache pruning helps.
+##     ⚠️  SHA-256: hashing runs on the main thread (no worker threads).
+##        Large files may briefly block the UI. Chunked hashing mitigates.
+##
+##   Windows:
+##     ✅ Threading: HTTP requests use background threads.
+##     ✅ Storage: user:// maps to %APPDATA%/Godot/app_userdata/.
+##     ✅ VFS: game directory is writable (user data area, not Program Files).
+##     ✅ File paths: SHA-256 hashes as filenames stay within path limits.
+##     ⚠️  Antivirus: pk3 (ZIP archive) writes may trigger AV scans,
+##        causing brief delays on download completion.
+##     ⚠️  File locking: if the engine has a pk3 open, deletion on
+##        disconnect may fail. Handled gracefully with error logging.
+##
+##   macOS:
+##     ✅ Threading: HTTP requests use background threads.
+##     ✅ Storage: user:// maps to ~/Library/Application Support/.
+##     ✅ VFS: game directory is writable from user data area.
+##     ✅ Sandbox: app_sandbox is disabled in export_presets.cfg.
+##     ✅ Case sensitivity: hash-based filenames avoid case conflicts.
+##
+##   Linux:
+##     ✅ Threading: HTTP requests use background threads.
+##     ✅ Storage: user:// maps to ~/.local/share/godot/app_userdata/.
+##     ✅ VFS: game directory is writable from user data area.
+##     ✅ Case sensitivity: all comparisons are lowercased.
+##     ⚠️  Snap/Flatpak: sandboxed installs may restrict network access
+##        or filesystem paths. The user:// path still works within the
+##        sandbox, and HTTPS access is typically allowed.
 extends Node
 
 ## Emitted when a missing map is detected and download begins.
@@ -283,7 +322,22 @@ func _on_search_completed(result: int, response_code: int,
 			get_tree().create_timer(1.0 * _retry_count).timeout.connect(
 				func(): _start_search(retry_map))
 			return
-		_fail("API unreachable after %d retries (result %d)" % [MAX_RETRIES, result])
+
+		# Platform-specific error hints for connection failures.
+		var hint := ""
+		if OS.has_feature("web"):
+			# On web, CORS blocks or mixed-content policies are the most
+			# common cause of HTTP failures.  The browser silently blocks
+			# the request and Godot reports RESULT_CANT_CONNECT (2) or
+			# RESULT_CONNECTION_ERROR (4).
+			hint = " (Web: this may be a CORS or mixed-content block)"
+		_fail("API unreachable after %d retries (result %d)%s" % [MAX_RETRIES, result, hint])
+		return
+
+	if response_code == 0 and OS.has_feature("web"):
+		# On web, a response_code of 0 with RESULT_SUCCESS can indicate
+		# a CORS-blocked preflight (browser returns empty response).
+		_fail("moh-db.com request blocked (Web: likely a CORS policy issue)")
 		return
 
 	if response_code < 200 or response_code >= 300:
@@ -730,7 +784,9 @@ func _show_ui_error(reason: String, show_disconnect: bool = false) -> void:
 	_status_label.text = reason
 	_progress_bar.value = 0.0
 	_progress_bar.modulate = Color(1.0, 0.3, 0.3)
-	_disconnect_btn.visible = show_disconnect
+	# Always show Disconnect button on errors — the user may want to leave
+	# the server after any kind of failure, not just "map not found".
+	_disconnect_btn.visible = true
 	_overlay.visible = true
 
 

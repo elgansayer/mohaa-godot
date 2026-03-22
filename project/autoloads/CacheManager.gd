@@ -126,7 +126,18 @@ func install_to_game_dir(sha256_hex: String, game_dir: String) -> bool:
 	var dst := FileAccess.open(dest_path, FileAccess.WRITE)
 	if dst == null:
 		src.close()
-		push_warning("CacheManager: Cannot write to game dir: ", dest_path, " error=", FileAccess.get_open_error())
+		var err_code := FileAccess.get_open_error()
+		var hint := ""
+		if err_code == ERR_FILE_NO_PERMISSION:
+			if OS.has_feature("windows"):
+				hint = " (Windows: the game directory may be read-only or blocked by antivirus)"
+			elif OS.has_feature("linux"):
+				hint = " (Linux: check file permissions on the game directory)"
+			elif OS.has_feature("macos"):
+				hint = " (macOS: check file permissions or Gatekeeper restrictions)"
+		elif OS.has_feature("web"):
+			hint = " (Web: IndexedDB storage quota may be exceeded)"
+		push_warning("CacheManager: Cannot write to game dir: ", dest_path, " error=", err_code, hint)
 		return false
 
 	while src.get_position() < src.get_length():

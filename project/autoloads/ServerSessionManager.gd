@@ -365,7 +365,15 @@ func _cleanup_session_files(game_dir: String) -> void:
 			if err == OK:
 				print("ServerSessionManager: Removed session file ", file_name)
 			else:
-				push_warning("ServerSessionManager: Failed to remove ", file_name, " error=", err)
+				# On Windows, the engine may still have the pk3 file open
+				# (file locking).  On Linux/macOS, this is less common but
+				# can happen if permissions changed.  Log the error but
+				# continue cleaning up other files — the orphaned file will
+				# be harmless (it's from the current session's server).
+				var hint := ""
+				if OS.has_feature("windows") and err == ERR_FILE_CANT_OPEN:
+					hint = " (Windows: file may be locked by the engine)"
+				push_warning("ServerSessionManager: Failed to remove ", file_name, " error=", err, hint)
 
 
 # ---------------------------------------------------------------------------
