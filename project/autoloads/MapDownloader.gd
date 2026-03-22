@@ -548,12 +548,10 @@ func _finish_install() -> void:
 		# FS_ConditionalRestart() triggers a full Com_GameRestart().
 		# For non-pure servers (OpenMoHAA default) this is redundant
 		# but harmless — FS_Restart is already guaranteed.
-		var current_fs_game := ""
 		if _runner.has_method("get_cvar_string"):
-			current_fs_game = _runner.get_cvar_string("fs_game")
-		if current_fs_game != "":
+			var current_fs_game: String = _runner.get_cvar_string("fs_game")
 			# Set to a dummy value then back to force the modified flag.
-			_runner.execute_command("set fs_game _reload_temp")
+			_runner.execute_command("set fs_game _dl_force_restart")
 			_runner.execute_command("set fs_game " + current_fs_game)
 		_runner.execute_command("reconnect")
 		print("MapDownloader: Sent 'reconnect' command.")
