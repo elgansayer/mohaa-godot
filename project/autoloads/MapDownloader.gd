@@ -8,7 +8,7 @@
 ##   4. Downloads the pk3, verifies its hash, caches it locally.
 ##   5. Associates the file with the current server via ServerSessionManager.
 ##   6. Installs it to the engine's game directory.
-##   7. Reconnects to the server automatically.
+##   7. Reloads the VFS and reconnects to the server automatically.
 ##
 ## UT-style isolation:
 ##   - Files are cached once and shared across servers (CacheManager).
@@ -31,6 +31,19 @@
 ##   - For pure servers (sv_pure=1), FS_ConditionalRestart is used, which
 ##     only restarts if the checksumFeed or fs_game changed.  We handle
 ##     this by toggling fs_game before reconnecting.
+##
+## VFS reload strategy (robust, works on all server types):
+##   1. If MoHAARunner exposes vfs_restart(): call it directly — guaranteed
+##      to rescan all pk3 files in the game directory.
+##   2. Fallback: execute "fs_restart" console command — same effect but
+##      must be queued through the command buffer.
+##   3. After VFS reload, send "reconnect" to rejoin the server.
+##
+## Map not found on moh-db.com:
+##   - Shows a clear error message in the download overlay.
+##   - Offers the user a "Disconnect" button to cleanly leave the server.
+##   - Auto-hides after 12 seconds.
+##   - Emits download_failed signal for other systems to react.
 ##
 ## moh-db.com API (see https://www.moh-db.com/api-docs):
 ##   GET /api/maps?search=<name>  → search for map files
@@ -76,6 +89,9 @@ var _progress_timer: float = 0.0
 ## Maximum retries for the download request itself.
 const MAX_DOWNLOAD_RETRIES := 1
 
+## How long the error overlay stays visible (seconds).
+const ERROR_DISPLAY_TIME := 12.0
+
 # -- UI --
 var _overlay: CanvasLayer = null
 var _panel: PanelContainer = null
@@ -83,6 +99,7 @@ var _title_label: Label = null
 var _status_label: Label = null
 var _progress_bar: ProgressBar = null
 var _detail_label: Label = null
+var _disconnect_btn: Button = null
 
 
 func _ready() -> void:
@@ -520,39 +537,52 @@ func _install_and_reconnect(file_hash: String) -> void:
 
 ## Common completion logic after successful install.
 ##
-## The reconnect flow relies on the engine's FS_Restart mechanism:
-##   reconnect → connect <server> → server sends gamestate
-##   → CL_ParseGamestate() → FS_ConditionalRestart() or FS_Restart()
+## VFS reload strategy (robust, works on all server types):
 ##
-## For non-pure servers (sv_pure=0, the OpenMoHAA default), the engine
-## takes the CA_CONNECTED + empty sv_paks path which calls FS_Restart()
-## directly — guaranteed to pick up the new pk3 file.
+##   Priority 1: vfs_restart() — If MoHAARunner exposes this C++ method,
+##   call it directly.  This is the cleanest path: it calls FS_Restart()
+##   in the engine to rescan all pk3 files.  No console command needed.
+##   (Requires a one-line addition to openmohaa-godot, see README.)
 ##
-## For pure servers (sv_pure=1), FS_ConditionalRestart() only restarts
-## if the checksumFeed changed.  To handle both cases reliably, we
-## toggle fs_game briefly to force the modified flag, ensuring
-## FS_ConditionalRestart() always triggers Com_GameRestart().
+##   Priority 2: "fs_restart" console command — Works the same way but
+##   goes through the command buffer.  May have a one-frame delay.
+##
+##   Priority 3: fs_game toggle + reconnect — For pure servers (sv_pure=1),
+##   FS_ConditionalRestart only restarts if checksumFeed or fs_game changed.
+##   Toggling fs_game forces the ->modified flag so FS_ConditionalRestart
+##   always triggers Com_GameRestart on reconnect.
+##
+## After VFS reload, we send "reconnect" to rejoin the server so the
+## newly-discovered pk3 can be used for the map load.
 func _finish_install() -> void:
 	var map_name := _current_map_name
 	_show_ui_reconnecting()
-	print("MapDownloader: Map installed — reconnecting in ", RECONNECT_DELAY, "s…")
+	print("MapDownloader: Map installed — reloading VFS and reconnecting in ", RECONNECT_DELAY, "s…")
 	download_completed.emit(map_name)
 
-	# Wait briefly then reconnect.
+	# Wait briefly then reload VFS and reconnect.
 	await get_tree().create_timer(RECONNECT_DELAY).timeout
 	_busy = false
 	_hide_ui()
 	if _runner and _runner.has_method("execute_command"):
-		# Force FS_Restart on reconnect for pure servers (sv_pure=1):
-		# Toggle fs_game to set the ->modified flag so that
-		# FS_ConditionalRestart() triggers a full Com_GameRestart().
-		# For non-pure servers (OpenMoHAA default) this is redundant
-		# but harmless — FS_Restart is already guaranteed.
+		# Strategy 1: Direct vfs_restart() if available (cleanest path).
+		if _runner.has_method("vfs_restart"):
+			_runner.vfs_restart()
+			print("MapDownloader: Called vfs_restart() — VFS reloaded.")
+		else:
+			# Strategy 2: Console command fallback.
+			_runner.execute_command("fs_restart")
+			print("MapDownloader: Sent 'fs_restart' command.")
+
+		# Strategy 3: fs_game toggle for pure server compatibility.
+		# Even after explicit FS_Restart, toggling fs_game ensures
+		# FS_ConditionalRestart on reconnect also triggers a full restart.
 		if _runner.has_method("get_cvar_string"):
 			var current_fs_game: String = _runner.get_cvar_string("fs_game")
 			# Set to a dummy value then back to force the modified flag.
 			_runner.execute_command("set fs_game _dl_force_restart")
 			_runner.execute_command("set fs_game " + current_fs_game)
+
 		_runner.execute_command("reconnect")
 		print("MapDownloader: Sent 'reconnect' command.")
 
@@ -566,11 +596,16 @@ func _fail(reason: String) -> void:
 	_downloading = false
 	_cleanup_temp()
 	push_warning("MapDownloader: FAILED — ", reason)
-	_show_ui_error(reason)
+
+	# Determine if this is a "map not found" error vs a network/download error.
+	var is_not_found := reason.contains("not found on moh-db.com") or \
+		reason.contains("No download URL") or \
+		reason.contains("not found on")
+	_show_ui_error(reason, is_not_found)
 	download_failed.emit(_current_map_name, reason)
 
-	# Auto-hide the error after 8 seconds.
-	await get_tree().create_timer(8.0).timeout
+	# Auto-hide the error after a delay.
+	await get_tree().create_timer(ERROR_DISPLAY_TIME).timeout
 	_hide_ui()
 
 
@@ -636,6 +671,15 @@ func _build_overlay_ui() -> void:
 	_detail_label.add_theme_font_size_override("font_size", 13)
 	vbox.add_child(_detail_label)
 
+	# Disconnect button (hidden by default, shown on errors).
+	_disconnect_btn = Button.new()
+	_disconnect_btn.text = "Disconnect"
+	_disconnect_btn.custom_minimum_size = Vector2(140, 36)
+	_disconnect_btn.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	_disconnect_btn.visible = false
+	_disconnect_btn.pressed.connect(_on_disconnect_pressed)
+	vbox.add_child(_disconnect_btn)
+
 
 func _show_ui_searching(map_name: String) -> void:
 	_title_label.text = "Missing Map"
@@ -643,6 +687,7 @@ func _show_ui_searching(map_name: String) -> void:
 	_progress_bar.value = 0.0
 	_progress_bar.modulate = Color.WHITE
 	_detail_label.text = ""
+	_disconnect_btn.visible = false
 	_overlay.visible = true
 
 
@@ -651,6 +696,7 @@ func _show_ui_downloading(file_name: String, file_size: int) -> void:
 	_status_label.text = file_name
 	_progress_bar.value = 0.0
 	_progress_bar.modulate = Color.WHITE
+	_disconnect_btn.visible = false
 	if file_size > 0:
 		_detail_label.text = "0 B / " + _human_size(file_size)
 	else:
@@ -671,24 +717,42 @@ func _update_ui_progress(percent: float, downloaded: int, total: int) -> void:
 
 func _show_ui_reconnecting() -> void:
 	_title_label.text = "Download Complete"
-	_status_label.text = "Reconnecting to server…"
+	_status_label.text = "Reloading VFS and reconnecting…"
 	_progress_bar.value = 100.0
 	_progress_bar.modulate = Color(0.3, 1.0, 0.3)
 	_detail_label.text = ""
+	_disconnect_btn.visible = false
 
 
-func _show_ui_error(reason: String) -> void:
-	_title_label.text = "Download Failed"
+func _show_ui_error(reason: String, show_disconnect: bool = false) -> void:
+	if show_disconnect:
+		_title_label.text = "Map Not Available"
+		_detail_label.text = "This map could not be found in the moh-db.com database."
+	else:
+		_title_label.text = "Download Failed"
+		_detail_label.text = ""
 	_status_label.text = reason
 	_progress_bar.value = 0.0
 	_progress_bar.modulate = Color(1.0, 0.3, 0.3)
-	_detail_label.text = ""
+	_disconnect_btn.visible = show_disconnect
 	_overlay.visible = true
 
 
 func _hide_ui() -> void:
 	if _overlay:
 		_overlay.visible = false
+
+
+## Called when the user clicks "Disconnect" on the error overlay.
+func _on_disconnect_pressed() -> void:
+	_hide_ui()
+	if _runner and _runner.has_method("execute_command"):
+		_runner.execute_command("disconnect")
+		print("MapDownloader: User disconnected from server.")
+	# End the server session so files are cleaned up.
+	var session_mgr: Node = get_node_or_null("/root/ServerSessionManager")
+	if session_mgr and session_mgr.is_session_active():
+		session_mgr.end_session()
 
 
 # ---------------------------------------------------------------------------
