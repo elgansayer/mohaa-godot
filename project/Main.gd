@@ -377,24 +377,22 @@ func _process(delta):
 			# instead of three separate calls.
 			var server_state = runner.get_server_state()
 			var current_map = runner.get_current_map()
-			_js.eval(
-				"window.__mohaaServerState=%d;"
-				% server_state
-				+ "window.__mohaaCurrentMap=%s;"
-				% JSON.stringify(current_map)
+			var state_js = (
+				("window.__mohaaServerState=%d;" % server_state)
+				+ ("window.__mohaaCurrentMap=%s;" % JSON.stringify(current_map))
 				+ "window.__mohaaEngineInit=true;"
 			)
+			_js.eval(state_js)
 
 			# Map-loaded fallback for startup maps already active before
 			# the signal path fires.
 			if current_map != "" and server_state == 3 and current_map != last_web_reported_map:
 				last_web_reported_map = current_map
-				_js.eval(
-					"window.__mohaaMapLoaded=%s;"
-					% JSON.stringify(current_map)
-					+ "window.__mohaaMapLoadedLog=%s;"
-					% JSON.stringify("Main: POLL map_loaded -> " + current_map)
+				var map_js = (
+					("window.__mohaaMapLoaded=%s;" % JSON.stringify(current_map))
+					+ ("window.__mohaaMapLoadedLog=%s;" % JSON.stringify("Main: POLL map_loaded -> " + current_map))
 				)
+				_js.eval(map_js)
 				print("Main: POLL map_loaded -> ", current_map)
 
 	if screenshot_pending:
