@@ -14,12 +14,39 @@ var last_state_logged = -999
 var web_net_tweaks_applied = false
 var last_web_reported_map = ""
 
+# -- Cached platform checks (avoid per-frame string lookups) --
+var _is_web := false
+var _js: Object = null # JavaScriptBridge singleton, cached once
+
+# -- JS bridge throttle (web) --
+# Batching JS eval calls and running them at a fixed interval instead of every
+# frame avoids the overhead of crossing the WASM↔JS boundary 4+ times per
+# rendered frame.  At 60 fps the unthrottled path would issue ~240 bridge
+# calls/sec; 250 ms throttle reduces that to ~16/sec — a 15× reduction.
+const _JS_POLL_INTERVAL := 0.25 # seconds between JS bridge batches
+var _js_poll_timer := 0.0
+
+# -- FPS counter --
+var _fps_label: Label = null
+var _fps_visible := false
+var _fps_update_timer := 0.0
+const _FPS_UPDATE_INTERVAL := 0.5 # refresh every 500 ms to avoid per-frame text allocation
+
 func _ready():
 	print("Main: Script started.")
+
+	# Cache platform checks once instead of calling OS.has_feature() every frame.
+	_is_web = OS.has_feature("web")
+	if _is_web and Engine.has_singleton("JavaScriptBridge"):
+		_js = Engine.get_singleton("JavaScriptBridge")
+
 	# WebGL2 cannot reliably handle 8x MSAA — disable to prevent framebuffer
 	# incomplete errors (GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT) and black screen.
-	if OS.has_feature("web"):
+	if _is_web:
 		get_viewport().msaa_3d = Viewport.MSAA_DISABLED
+
+	_setup_fps_counter()
+
 	if not ClassDB.class_exists("MoHAARunner"):
 		printerr("Main: ERROR - Class 'MoHAARunner' not found in ClassDB. Extension might fail to load.")
 		return
@@ -76,7 +103,7 @@ func _ready():
 	# On web: also read URL query params
 	# e.g. http://localhost:8086/mohaa.html\?map\=dm/mohdm1
 	#       http://localhost:8086/mohaa.html\?server\=1   (exec server.cfg)
-	if OS.has_feature("web"):
+	if _is_web:
 		var url_params = _parse_url_params()
 		if url_params.has("map"):
 			launch_map = url_params["map"]
@@ -116,7 +143,7 @@ func _ready():
 		# which persists and causes RF_DONTDRAW → invisible FPS model.
 		if not launch_dedicated:
 			startup_args += " +set g_gametype 0"
-		if OS.has_feature("web"):
+		if _is_web:
 			# Web: emscripten VFS root = game data dir; GameSpy off
 			startup_args += " +set fs_basepath . +set fs_homedatapath . +set fs_homepath . +set r_fullscreen 0 +set ui_gamespy 0 +set sv_gamespy 0"
 
@@ -136,12 +163,10 @@ func _ready():
 			startup_args += extra_engine_cmds
 
 		runner.set_startup_args(startup_args)
-		if OS.has_feature("web") and Engine.has_singleton("JavaScriptBridge"):
-			var js = Engine.get_singleton("JavaScriptBridge")
-			if js:
-				# Expose effective startup command line for browser-side diagnostics.
-				js.eval("window.__mohaaStartupArgs = " + JSON.stringify(startup_args) + ";")
-				js.eval("window.__mohaaLaunchMap = " + JSON.stringify(launch_map) + ";")
+		if _is_web and _js:
+			# Expose effective startup command line for browser-side diagnostics.
+			_js.eval("window.__mohaaStartupArgs = " + JSON.stringify(startup_args) + ";")
+			_js.eval("window.__mohaaLaunchMap = " + JSON.stringify(launch_map) + ";")
 		runner.name = "MoHAARunnerInstance"
 		add_child(runner)
 		print("Main: MoHAARunner added to tree.")
@@ -165,15 +190,13 @@ func _ready():
 # Parse URL query string into a dictionary (web only).
 func _parse_url_params() -> Dictionary:
 	var result = {}
-	if not OS.has_feature("web"):
+	if not _is_web:
 		return result
 	var query = ""
-	if Engine.has_singleton("JavaScriptBridge"):
-		var js = Engine.get_singleton("JavaScriptBridge")
-		if js:
-			var q = js.eval("window.location.search")
-			if typeof(q) == TYPE_STRING:
-				query = q
+	if _js:
+		var q = _js.eval("window.location.search")
+		if typeof(q) == TYPE_STRING:
+			query = q
 	if query.begins_with("?"):
 		query = query.substr(1)
 	for pair in query.split("&"):
@@ -191,46 +214,61 @@ func _parse_url_params() -> Dictionary:
 #   - value contains '/'  →  wss://value   (HTTPS reverse-proxy path)
 #   - value is host:port  →  ws://value    (plain LAN/direct relay)
 func _auto_relay_url() -> String:
-	if not Engine.has_singleton("JavaScriptBridge"):
+	if not _js:
 		return ""
-	var js = Engine.get_singleton("JavaScriptBridge")
-	if not js:
-		return ""
-	var hostname = js.eval("window.location.hostname")
+	var hostname = _js.eval("window.location.hostname")
 	if typeof(hostname) != TYPE_STRING or hostname == "":
 		return ""
 	# The relay always runs behind the nginx /relay proxy — both in Docker
 	# (port 80 inside container, mapped to host 8086) and in production
 	# (HTTPS reverse-proxy).  Never connect to port 12300 directly; it is
 	# only exposed inside the container.
-	var protocol = js.eval("window.location.protocol")
+	var protocol = _js.eval("window.location.protocol")
 	if typeof(protocol) == TYPE_STRING and protocol == "https:":
 		# HTTPS — default port (443); scheme handled by NET_WS_BuildURL.
 		return hostname + "/relay"
 	# HTTP — include the explicit port so the browser connects to the
 	# same origin (e.g. localhost:8086/relay, not localhost:12300).
-	var port = js.eval("window.location.port")
+	var port = _js.eval("window.location.port")
 	if typeof(port) == TYPE_STRING and port != "" and port != "80":
 		return hostname + ":" + port + "/relay"
 	return hostname + "/relay"
+
+# -- FPS counter setup --
+# Lightweight overlay label on a dedicated CanvasLayer so it draws on top of
+# the engine viewport.  Hidden by default; toggled with F3.
+func _setup_fps_counter():
+	if OS.has_feature("headless") or DisplayServer.get_name() == "headless":
+		return
+	var layer = CanvasLayer.new()
+	layer.layer = 100 # above everything
+	layer.name = "FPSLayer"
+	add_child(layer)
+
+	_fps_label = Label.new()
+	_fps_label.text = ""
+	_fps_label.visible = false
+	_fps_label.add_theme_font_size_override("font_size", 18)
+	_fps_label.add_theme_color_override("font_color", Color(0.0, 1.0, 0.0))
+	_fps_label.add_theme_color_override("font_shadow_color", Color(0.0, 0.0, 0.0, 0.8))
+	_fps_label.add_theme_constant_override("shadow_offset_x", 1)
+	_fps_label.add_theme_constant_override("shadow_offset_y", 1)
+	_fps_label.position = Vector2(8, 8)
+	layer.add_child(_fps_label)
 
 # -- Signal handlers --
 
 func _on_engine_error(message: String):
 	printerr("Main: ENGINE ERROR: ", message)
-	if OS.has_feature("web") and Engine.has_singleton("JavaScriptBridge"):
-		var js = Engine.get_singleton("JavaScriptBridge")
-		if js:
-			# Expose engine init/runtime failures to browser E2E harness.
-			js.eval("window.__mohaaEngineError = " + JSON.stringify(message) + ";")
+	if _is_web and _js:
+		# Expose engine init/runtime failures to browser E2E harness.
+		_js.eval("window.__mohaaEngineError = " + JSON.stringify(message) + ";")
 
 func _on_map_loaded(map_name: String):
 	print("Main: SIGNAL map_loaded -> ", map_name)
-	if OS.has_feature("web") and Engine.has_singleton("JavaScriptBridge"):
-		var js = Engine.get_singleton("JavaScriptBridge")
-		if js:
-			# Expose map-load state for deterministic browser E2E tests.
-			js.eval("window.__mohaaMapLoaded = " + JSON.stringify(map_name) + ";")
+	if _is_web and _js:
+		# Expose map-load state for deterministic browser E2E tests.
+		_js.eval("window.__mohaaMapLoaded = " + JSON.stringify(map_name) + ";")
 	if OS.has_feature("headless") or DisplayServer.get_name() == "headless":
 		print("Main: Headless mode detected, skipping auto screenshot.")
 		return
@@ -243,11 +281,9 @@ func _on_map_unloaded():
 
 func _on_engine_shutdown():
 	print("Main: SIGNAL engine_shutdown_requested")
-	if OS.has_feature("web") and Engine.has_singleton("JavaScriptBridge"):
-		var js = Engine.get_singleton("JavaScriptBridge")
-		if js:
-			js.eval("if(typeof onEngineQuit === 'function') onEngineQuit();")
-			print("Main: Called JS onEngineQuit()")
+	if _is_web and _js:
+		_js.eval("if(typeof onEngineQuit === 'function') onEngineQuit();")
+		print("Main: Called JS onEngineQuit()")
 	# Quit the Godot tree. On web this stops the Emscripten main loop
 	# (preventing CxxException storms); the JS onEngineQuit() handler
 	# navigates back to the game selector after a short delay.
@@ -292,6 +328,12 @@ func _unhandled_key_input(event: InputEvent):
 		if runner and runner.is_engine_initialized():
 			runner.execute_command("set r_fullscreen %d" % (1 if going_fs else 0))
 		print("Main: Fullscreen toggled")
+	elif event.keycode == KEY_F3:
+		# F3 -- toggle FPS counter overlay
+		_fps_visible = not _fps_visible
+		if _fps_label:
+			_fps_label.visible = _fps_visible
+		print("Main: FPS counter -> ", "ON" if _fps_visible else "OFF")
 	elif event.keycode == KEY_F10:
 		# F10 -- exec server.cfg (listen server: host + play on dm/mohdm1)
 		if runner and runner.is_engine_initialized():
@@ -304,22 +346,56 @@ func _unhandled_key_input(event: InputEvent):
 			print("Main: Executed -> connect localhost")
 
 func _process(delta):
+	# -- FPS counter update (throttled) --
+	if _fps_visible and _fps_label:
+		_fps_update_timer += delta
+		if _fps_update_timer >= _FPS_UPDATE_INTERVAL:
+			_fps_update_timer = 0.0
+			_fps_label.text = "%d FPS" % Engine.get_frames_per_second()
+
 	# One-time GameSpy re-disable for web (in case engine reset the cvars)
-	if OS.has_feature("web") and runner and runner.is_engine_initialized() and not web_net_tweaks_applied:
+	if _is_web and runner and runner.is_engine_initialized() and not web_net_tweaks_applied:
 		web_net_tweaks_applied = true
 		runner.execute_command("set ui_gamespy 0; set sv_gamespy 0")
 		print("Main: Web tweaks applied -> ui_gamespy=0 sv_gamespy=0")
 
-	# Web: poll for pending commands from JavaScript (e2e test support).
-	# Browser tests set window.__mohaaPendingCommand = "map dm/mohdm2" etc.
-	if OS.has_feature("web") and runner and runner.is_engine_initialized():
-		if Engine.has_singleton("JavaScriptBridge"):
-			var js = Engine.get_singleton("JavaScriptBridge")
-			if js:
-				var cmd = js.eval("(function(){ var c = window.__mohaaPendingCommand; if(typeof c === 'string' && c.length > 0){ window.__mohaaPendingCommand = ''; return c; } return ''; })()")
-				if typeof(cmd) == TYPE_STRING and cmd != "":
-					print("Main: JS command bridge -> ", cmd)
-					runner.execute_command(cmd)
+	# -- Web JS bridge (throttled) --
+	# All JS↔WASM bridge calls are batched into a single interval instead of
+	# running every frame.  This avoids 4+ js.eval() calls per rendered frame
+	# which are expensive cross-boundary calls on Emscripten.
+	if _is_web and _js and runner and runner.is_engine_initialized():
+		_js_poll_timer += delta
+		if _js_poll_timer >= _JS_POLL_INTERVAL:
+			_js_poll_timer = 0.0
+			# Poll for pending commands from browser E2E tests.
+			var cmd = _js.eval("(function(){ var c = window.__mohaaPendingCommand; if(typeof c === 'string' && c.length > 0){ window.__mohaaPendingCommand = ''; return c; } return ''; })()")
+			if typeof(cmd) == TYPE_STRING and cmd != "":
+				print("Main: JS command bridge -> ", cmd)
+				runner.execute_command(cmd)
+
+			# Expose engine state for E2E diagnostics — single batched eval
+			# instead of three separate calls.
+			var server_state = runner.get_server_state()
+			var current_map = runner.get_current_map()
+			_js.eval(
+				"window.__mohaaServerState=%d;"
+				% server_state
+				+ "window.__mohaaCurrentMap=%s;"
+				% JSON.stringify(current_map)
+				+ "window.__mohaaEngineInit=true;"
+			)
+
+			# Map-loaded fallback for startup maps already active before
+			# the signal path fires.
+			if current_map != "" and server_state == 3 and current_map != last_web_reported_map:
+				last_web_reported_map = current_map
+				_js.eval(
+					"window.__mohaaMapLoaded=%s;"
+					% JSON.stringify(current_map)
+					+ "window.__mohaaMapLoadedLog=%s;"
+					% JSON.stringify("Main: POLL map_loaded -> " + current_map)
+				)
+				print("Main: POLL map_loaded -> ", current_map)
 
 	if screenshot_pending:
 		screenshot_timer += delta
@@ -334,25 +410,6 @@ func _process(delta):
 			last_state_logged = server_state
 			print("Main: server_state -> ", runner.get_server_state_string(),
 				" (", server_state, ")")
-
-		if OS.has_feature("web") and current_map != "" and server_state == 3 and current_map != last_web_reported_map:
-			last_web_reported_map = current_map
-			if Engine.has_singleton("JavaScriptBridge"):
-				var js = Engine.get_singleton("JavaScriptBridge")
-				if js:
-					# Web E2E fallback: startup map can already be active before the
-					# original signal path is observed, so publish the live map state.
-					js.eval("window.__mohaaMapLoaded = " + JSON.stringify(current_map) + ";")
-					js.eval("window.__mohaaMapLoadedLog = " + JSON.stringify("Main: POLL map_loaded -> " + current_map) + ";")
-				print("Main: POLL map_loaded -> ", current_map)
-
-		# Continuously expose engine state to browser for E2E diagnostics.
-		if OS.has_feature("web") and Engine.has_singleton("JavaScriptBridge"):
-			var js = Engine.get_singleton("JavaScriptBridge")
-			if js:
-				js.eval("window.__mohaaServerState = %d;" % server_state)
-				js.eval("window.__mohaaCurrentMap = %s;" % JSON.stringify(current_map))
-				js.eval("window.__mohaaEngineInit = true;")
 
 		status_log_timer += delta
 		if status_log_timer >= 5.0:

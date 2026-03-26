@@ -25,6 +25,12 @@ config/icon="res://icon.svg"
 window/size/viewport_width=1024
 window/size/viewport_height=768
 
+[physics]
+
+# No GDScript uses _physics_process; the OpenMoHAA engine runs its own
+# physics.  Halving the Godot physics tick frees CPU time each frame.
+common/physics_ticks_per_second=30
+
 [input]
 
 toggle_hud={
@@ -52,5 +58,9 @@ toggle_fullscreen={
 
 [rendering]
 
+# Use the lighter GL Compatibility renderer on web and mobile where Forward+
+# is either unavailable (WebGL2) or too expensive.  Desktop keeps Forward+.
+renderer/rendering_method.web="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"
 textures/vram_compression/import_etc2_astc=true
 anti_aliasing/quality/msaa_3d=0
