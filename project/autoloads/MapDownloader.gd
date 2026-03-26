@@ -46,8 +46,17 @@
 ##   - Emits download_failed signal for other systems to react.
 ##
 ## moh-db.com API (see https://www.moh-db.com/api-docs):
-##   GET /api/maps?search=<name>  → search for map files
-##   Response contains download URLs and file metadata.
+##   Base URL: https://api.moh-db.com
+##   Authentication: X-API-Key header (set via Project Settings).
+##
+##   GET /api/external/v1/maps?mapName=<name>&page=0&size=20
+##     Response: PageMapDto { content: MapDto[], totalElements, ... }
+##     MapDto has: mapName, downloadLink, mapFile (FileInfoDto), ...
+##     FileInfoDto has: filename, filesize, downloadLink, ...
+##
+##   GET /api/external/v1/mods?modName=<name>&page=0&size=20
+##     Response: PageModDto { content: ModDto[], totalElements, ... }
+##     ModDto has: modName, downloadLink, pk3DownloadLink, file, pk3File, ...
 ##
 ## Platform evaluation:
 ##
@@ -98,8 +107,13 @@ signal download_completed(map_name: String)
 ## Emitted on any failure during the search or download.
 signal download_failed(map_name: String, reason: String)
 
-## moh-db.com API base URL.  Change this only if the API moves.
-const API_BASE_URL := "https://www.moh-db.com/api"
+## moh-db.com API base URL (see https://www.moh-db.com/api-docs).
+const API_BASE_URL := "https://api.moh-db.com"
+## API key for moh-db.com authentication (X-API-Key header).
+## Set via Project Settings > MapDownloader > api_key, or override this constant.
+var _api_key: String = ""
+## Number of results per page when searching the API.
+const API_PAGE_SIZE := 20
 ## Seconds to wait before reconnecting after a successful install.
 const RECONNECT_DELAY := 2.0
 ## Maximum download time in seconds.
@@ -142,6 +156,10 @@ var _disconnect_btn: Button = null
 
 
 func _ready() -> void:
+	# Load API key from project settings if available.
+	if ProjectSettings.has_setting("map_downloader/api_key"):
+		_api_key = ProjectSettings.get_setting("map_downloader/api_key", "")
+
 	_http_search = HTTPRequest.new()
 	_http_search.timeout = 15.0
 	_http_search.use_threads = not OS.has_feature("web")
@@ -302,10 +320,17 @@ func _start_search(map_name: String) -> void:
 	_show_ui_searching(map_name)
 	download_started.emit(map_name)
 
-	var url := API_BASE_URL + "/maps?search=" + search_term.uri_encode()
+	# moh-db.com external API v1: GET /api/external/v1/maps?mapName=<name>
+	var url := API_BASE_URL + "/api/external/v1/maps?mapName=" + search_term.uri_encode() \
+		+ "&page=0&size=" + str(API_PAGE_SIZE)
 	print("MapDownloader: Searching moh-db.com — ", url)
 
-	var err := _http_search.request(url)
+	# The API requires an X-API-Key header for authentication.
+	var headers: PackedStringArray = []
+	if _api_key != "":
+		headers.append("X-API-Key: " + _api_key)
+
+	var err := _http_search.request(url, headers)
 	if err != OK:
 		_fail("API search request failed: error %d" % err)
 
@@ -350,60 +375,78 @@ func _on_search_completed(result: int, response_code: int,
 		_fail("Invalid JSON from moh-db.com API")
 		return
 
-	# The API may return results in various wrapper formats.
-	# We support: { "data": [...] }, { "results": [...] }, or a bare [...].
+	# The API returns a PageMapDto with a "content" array of MapDto objects.
 	var results: Array = []
-	if parsed is Array:
+	if parsed is Dictionary:
+		if parsed.has("content") and parsed["content"] is Array:
+			results = parsed["content"]
+	elif parsed is Array:
+		# Bare array fallback (unlikely but safe).
 		results = parsed
-	elif parsed is Dictionary:
-		if parsed.has("data") and parsed["data"] is Array:
-			results = parsed["data"]
-		elif parsed.has("results") and parsed["results"] is Array:
-			results = parsed["results"]
 
 	if results.is_empty():
 		_fail("Map '%s' not found on moh-db.com" % _current_map_name, true)
 		return
 
-	# Pick the best match.  Prefer an entry whose name matches exactly.
+	# Pick the best match.  Prefer an entry whose mapName matches exactly.
 	var best: Dictionary = results[0]
 	var search_lower := _current_map_name.get_file().to_lower()
 	for entry in results:
 		if not entry is Dictionary:
 			continue
-		var entry_name: String = entry.get("name", entry.get("file_name", "")).to_lower()
+		# MapDto.mapName is the canonical map name field.
+		var entry_map_name: Variant = entry.get("mapName", "")
+		if entry_map_name == null:
+			entry_map_name = ""
+		var entry_name: String = String(entry_map_name).to_lower()
 		entry_name = entry_name.trim_suffix(".pk3").trim_suffix(".zip")
 		if entry_name == search_lower:
 			best = entry
 			break
 
-	# Extract download URL from the result.
-	var download_url: String = best.get("download_url",
-		best.get("downloadUrl",
-			best.get("url",
-				best.get("file_url", ""))))
+	# Extract download URL from the MapDto.
+	# Priority: mapFile.downloadLink > top-level downloadLink
+	var download_url: String = ""
+	var map_file: Variant = best.get("mapFile")
+	if map_file is Dictionary and map_file.get("downloadLink", "") != "":
+		download_url = map_file["downloadLink"]
 	if download_url == "":
-		# Some APIs require constructing the URL from an ID.
-		var entry_id = best.get("id", "")
-		if entry_id != "":
-			download_url = API_BASE_URL + "/maps/" + str(entry_id) + "/download"
+		var top_link: Variant = best.get("downloadLink", "")
+		if top_link != null:
+			download_url = String(top_link)
 
 	if download_url == "":
 		_fail("No download URL found for '%s'" % _current_map_name, true)
 		return
 
-	var file_name: String = best.get("file_name",
-		best.get("fileName",
-			best.get("name", _current_map_name)))
-	# Strip any existing archive extension before normalizing.
+	# Extract file name and size from MapDto.mapFile (FileInfoDto).
+	var file_name: String = ""
+	var file_size: int = 0
+	if map_file is Dictionary:
+		var fn: Variant = map_file.get("filename", "")
+		if fn != null:
+			file_name = String(fn)
+		file_size = int(map_file.get("filesize", 0))
+
+	# Fallback to map name if no filename in mapFile.
+	if file_name == "":
+		var mn: Variant = best.get("mapName", "")
+		if mn != null and String(mn) != "":
+			file_name = String(mn)
+		else:
+			file_name = _current_map_name
+
+	# Ensure the filename ends with .pk3.
+	var has_archive_ext := false
 	for ext in [".pk3", ".zip"]:
 		if file_name.to_lower().ends_with(ext):
-			file_name = file_name.substr(0, file_name.length() - ext.length())
+			has_archive_ext = true
 			break
-	file_name += ".pk3"
+	if not has_archive_ext:
+		file_name += ".pk3"
 
-	var file_size: int = best.get("file_size", best.get("fileSize", best.get("size", 0)))
-	var file_hash: String = best.get("sha256", best.get("hash", best.get("md5", "")))
+	# The moh-db.com API does not provide file hashes; we compute SHA-256 after download.
+	var file_hash: String = ""
 
 	print("MapDownloader: Found — ", file_name,
 		" size=", _human_size(file_size) if file_size > 0 else "unknown",
