@@ -26,12 +26,6 @@ var _js: Object = null # JavaScriptBridge singleton, cached once
 const _JS_POLL_INTERVAL := 0.25 # seconds between JS bridge batches
 var _js_poll_timer := 0.0
 
-# -- FPS counter --
-var _fps_label: Label = null
-var _fps_visible := false
-var _fps_update_timer := 0.0
-const _FPS_UPDATE_INTERVAL := 0.5 # refresh every 500 ms to avoid per-frame text allocation
-
 func _ready():
 	print("Main: Script started.")
 
@@ -44,8 +38,6 @@ func _ready():
 	# incomplete errors (GL_FRAMEBUFFER_INCOMPLETE_ATTACHMENT) and black screen.
 	if _is_web:
 		get_viewport().msaa_3d = Viewport.MSAA_DISABLED
-
-	_setup_fps_counter()
 
 	if not ClassDB.class_exists("MoHAARunner"):
 		printerr("Main: ERROR - Class 'MoHAARunner' not found in ClassDB. Extension might fail to load.")
@@ -234,28 +226,6 @@ func _auto_relay_url() -> String:
 		return hostname + ":" + port + "/relay"
 	return hostname + "/relay"
 
-# -- FPS counter setup --
-# Lightweight overlay label on a dedicated CanvasLayer so it draws on top of
-# the engine viewport.  Hidden by default; toggled with F3.
-func _setup_fps_counter():
-	if OS.has_feature("headless") or DisplayServer.get_name() == "headless":
-		return
-	var layer = CanvasLayer.new()
-	layer.layer = 100 # above everything
-	layer.name = "FPSLayer"
-	add_child(layer)
-
-	_fps_label = Label.new()
-	_fps_label.text = ""
-	_fps_label.visible = false
-	_fps_label.add_theme_font_size_override("font_size", 18)
-	_fps_label.add_theme_color_override("font_color", Color(0.0, 1.0, 0.0))
-	_fps_label.add_theme_color_override("font_shadow_color", Color(0.0, 0.0, 0.0, 0.8))
-	_fps_label.add_theme_constant_override("shadow_offset_x", 1)
-	_fps_label.add_theme_constant_override("shadow_offset_y", 1)
-	_fps_label.position = Vector2(8, 8)
-	layer.add_child(_fps_label)
-
 # -- Signal handlers --
 
 func _on_engine_error(message: String):
@@ -328,12 +298,6 @@ func _unhandled_key_input(event: InputEvent):
 		if runner and runner.is_engine_initialized():
 			runner.execute_command("set r_fullscreen %d" % (1 if going_fs else 0))
 		print("Main: Fullscreen toggled")
-	elif event.keycode == KEY_F3:
-		# F3 -- toggle FPS counter overlay
-		_fps_visible = not _fps_visible
-		if _fps_label:
-			_fps_label.visible = _fps_visible
-		print("Main: FPS counter -> ", "ON" if _fps_visible else "OFF")
 	elif event.keycode == KEY_F10:
 		# F10 -- exec server.cfg (listen server: host + play on dm/mohdm1)
 		if runner and runner.is_engine_initialized():
@@ -346,13 +310,6 @@ func _unhandled_key_input(event: InputEvent):
 			print("Main: Executed -> connect localhost")
 
 func _process(delta):
-	# -- FPS counter update (throttled) --
-	if _fps_visible and _fps_label:
-		_fps_update_timer += delta
-		if _fps_update_timer >= _FPS_UPDATE_INTERVAL:
-			_fps_update_timer = 0.0
-			_fps_label.text = "%d FPS" % Engine.get_frames_per_second()
-
 	# One-time GameSpy re-disable for web (in case engine reset the cvars)
 	if _is_web and runner and runner.is_engine_initialized() and not web_net_tweaks_applied:
 		web_net_tweaks_applied = true
