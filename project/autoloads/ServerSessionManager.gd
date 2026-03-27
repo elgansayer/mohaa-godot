@@ -260,7 +260,7 @@ func install_file_for_session(sha256_hex: String, file_name: String, content_typ
 		# It may be a vanilla game file or leftover from a previous session.
 		return true
 
-	var ok := cache.install_to_game_dir(sha256_hex, game_dir)
+	var ok: bool = cache.install_to_game_dir(sha256_hex, game_dir)
 	if ok:
 		_session_installed[file_name] = content_type
 	return ok
@@ -347,7 +347,7 @@ func _install_server_files(server_id: String, game_dir: String) -> void:
 			# It may be a vanilla game file we must not remove.
 			continue
 
-		var ok := cache.install_to_game_dir(hash_key, game_dir)
+		var ok: bool = cache.install_to_game_dir(hash_key, game_dir)
 		if ok:
 			_session_installed[file_name] = content_type
 			print("ServerSessionManager: Pre-installed ", file_name, " for server ", server_id)
@@ -359,7 +359,7 @@ func _install_server_files(server_id: String, game_dir: String) -> void:
 func _cleanup_session_files(game_dir: String) -> void:
 	var dir_path := _ensure_trailing_slash(game_dir)
 	for file_name in _session_installed:
-		var full_path := dir_path + file_name
+		var full_path: String = dir_path + file_name
 		if FileAccess.file_exists(full_path):
 			var err := DirAccess.remove_absolute(full_path)
 			if err == OK:
@@ -439,8 +439,8 @@ func _get_game_dir() -> String:
 	if _game_dir != "":
 		return _game_dir
 
-	if _runner and _runner.has_method("vfs_get_gamedir"):
-		_game_dir = _runner.vfs_get_gamedir()
+	if _runner and _runner.has_method("vfs_get_writable_gamedir"):
+		_game_dir = _runner.vfs_get_writable_gamedir()
 	if _game_dir == "":
 		if _runner and _runner.has_method("get_basepath"):
 			var base: String = _runner.get_basepath()

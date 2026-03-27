@@ -138,6 +138,7 @@ var _download_path: String = ""     # temp file while downloading
 var _retry_count: int = 0
 var _download_retry_count: int = 0
 var _progress_timer: float = 0.0
+var _last_server_address: String = ""  # stored before ERR_DROP clears clc
 
 ## Maximum retries for the download request itself.
 const MAX_DOWNLOAD_RETRIES := 1
@@ -226,6 +227,10 @@ func _on_engine_error(message: String) -> void:
 
 	_busy = true  # Prevent concurrent processing until this cycle completes.
 	_current_map_bsp = bsp_path
+
+	# Capture the server address NOW, before ERR_DROP clears clc.servername.
+	_last_server_address = _detect_server_address()
+
 	# Strip "maps/" prefix and ".bsp" suffix to get the map name.
 	var map_name := bsp_path
 	if map_name.begins_with("maps/"):
@@ -272,6 +277,17 @@ func _ensure_server_session() -> void:
 		server_addr = "unknown_server"
 
 	session_mgr.begin_session(server_addr)
+
+
+## Read the current server address from engine cvars.
+func _detect_server_address() -> String:
+	if _runner == null or not _runner.has_method("get_cvar_string"):
+		return ""
+	for cvar_name in ServerSessionManager.SERVER_ADDRESS_CVARS:
+		var val: String = _runner.get_cvar_string(cvar_name)
+		if val != "" and val != "0.0.0.0" and val != "localhost":
+			return val
+	return ""
 
 
 ## Check if the map is already in the shared cache (downloaded for any server).
@@ -598,10 +614,10 @@ func _install_and_reconnect(file_hash: String) -> void:
 	# Try ServerSessionManager first (UT-style: tracks per-server associations).
 	var session_mgr: Node = get_node_or_null("/root/ServerSessionManager")
 	if session_mgr and session_mgr.is_session_active():
-		var file_name := cache.get_original_name(file_hash)
+		var file_name: String = cache.get_original_name(file_hash)
 		if file_name == "":
 			file_name = file_hash.left(12) + ".pk3"
-		var ok := session_mgr.install_file_for_session(
+		var ok: bool = session_mgr.install_file_for_session(
 			file_hash, file_name, ServerSessionManager.TYPE_MAP)
 		if ok:
 			_finish_install()
@@ -610,8 +626,8 @@ func _install_and_reconnect(file_hash: String) -> void:
 
 	# Direct install fallback (no session manager or session failed).
 	var game_dir := ""
-	if _runner and _runner.has_method("vfs_get_gamedir"):
-		game_dir = _runner.vfs_get_gamedir()
+	if _runner and _runner.has_method("vfs_get_writable_gamedir"):
+		game_dir = _runner.vfs_get_writable_gamedir()
 	if game_dir == "":
 		if _runner and _runner.has_method("get_basepath"):
 			game_dir = _runner.get_basepath()
@@ -624,7 +640,7 @@ func _install_and_reconnect(file_hash: String) -> void:
 		_fail("Cannot determine game directory for file installation")
 		return
 
-	var ok := cache.install_to_game_dir(file_hash, game_dir)
+	var ok: bool = cache.install_to_game_dir(file_hash, game_dir)
 	if not ok:
 		_fail("Failed to install map to game directory")
 		return
@@ -636,23 +652,14 @@ func _install_and_reconnect(file_hash: String) -> void:
 ##
 ## VFS reload strategy (robust, works on all server types):
 ##
-##   Priority 1: vfs_restart() — If MoHAARunner exposes this C++ method,
-##   call it directly.  This is the cleanest path: it calls FS_Restart()
-##   in the engine to rescan all pk3 files.  No console command needed.
-##   (Requires a one-line addition to openmohaa-godot, see README.)
+##   Priority 1: vfs_restart() — calls FS_Restart() directly to rescan pk3s.
+##   Priority 2: "fs_restart" console command fallback.
 ##
-##   Priority 2: "fs_restart" console command — Works the same way but
-##   goes through the command buffer.  May have a one-frame delay.
-##
-##   Priority 3: fs_game toggle + reconnect — For pure servers (sv_pure=1),
-##   FS_ConditionalRestart only restarts if checksumFeed or fs_game changed.
-##   Toggling fs_game forces the ->modified flag so FS_ConditionalRestart
-##   always triggers Com_GameRestart on reconnect.
-##
-## After VFS reload, we send "reconnect" to rejoin the server so the
-## newly-discovered pk3 can be used for the map load.
+## After VFS reload, we use "connect <addr>" (not "reconnect") because
+## ERR_DROP clears clc.servername, making the reconnect command fail.
 func _finish_install() -> void:
 	var map_name := _current_map_name
+	var server_addr := _last_server_address
 	_show_ui_reconnecting()
 	print("MapDownloader: Map installed — reloading VFS and reconnecting in ", RECONNECT_DELAY, "s…")
 	download_completed.emit(map_name)
@@ -662,26 +669,23 @@ func _finish_install() -> void:
 	_busy = false
 	_hide_ui()
 	if _runner and _runner.has_method("execute_command"):
-		# Strategy 1: Direct vfs_restart() if available (cleanest path).
+		# Reload VFS so the new pk3 is discovered.
 		if _runner.has_method("vfs_restart"):
 			_runner.vfs_restart()
 			print("MapDownloader: Called vfs_restart() — VFS reloaded.")
 		else:
-			# Strategy 2: Console command fallback.
 			_runner.execute_command("fs_restart")
 			print("MapDownloader: Sent 'fs_restart' command.")
 
-		# Strategy 3: fs_game toggle for pure server compatibility.
-		# Even after explicit FS_Restart, toggling fs_game ensures
-		# FS_ConditionalRestart on reconnect also triggers a full restart.
-		if _runner.has_method("get_cvar_string"):
-			var current_fs_game: String = _runner.get_cvar_string("fs_game")
-			# Set to a dummy value then back to force the modified flag.
-			_runner.execute_command("set fs_game _dl_force_restart")
-			_runner.execute_command("set fs_game " + current_fs_game)
-
-		_runner.execute_command("reconnect")
-		print("MapDownloader: Sent 'reconnect' command.")
+		# Reconnect to the server.  Use explicit "connect <addr>" because
+		# ERR_DROP clears clc.servername so "reconnect" would fail.
+		if server_addr != "":
+			_runner.execute_command("connect " + server_addr)
+			print("MapDownloader: Sent 'connect ", server_addr, "' command.")
+		else:
+			# Last resort: try reconnect anyway (may work if connection wasn't dropped).
+			_runner.execute_command("reconnect")
+			print("MapDownloader: Sent 'reconnect' command (no server address available).")
 
 
 # ---------------------------------------------------------------------------
