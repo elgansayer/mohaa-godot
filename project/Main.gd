@@ -13,6 +13,9 @@ var exec_cfg = ""
 var last_state_logged = -999
 var web_net_tweaks_applied = false
 var last_web_reported_map = ""
+# Throttle web JS bridge calls to avoid per-frame overhead
+const _JS_POLL_INTERVAL = 0.25  # seconds (~4 Hz)
+var _js_poll_timer = 0.0
 
 func _ready():
 	print("Main: Script started.")
@@ -347,12 +350,16 @@ func _process(delta):
 				print("Main: POLL map_loaded -> ", current_map)
 
 		# Continuously expose engine state to browser for E2E diagnostics.
+		# Throttled to ~4 Hz to avoid per-frame JS bridge overhead.
 		if OS.has_feature("web") and Engine.has_singleton("JavaScriptBridge"):
-			var js = Engine.get_singleton("JavaScriptBridge")
-			if js:
-				js.eval("window.__mohaaServerState = %d;" % server_state)
-				js.eval("window.__mohaaCurrentMap = %s;" % JSON.stringify(current_map))
-				js.eval("window.__mohaaEngineInit = true;")
+			_js_poll_timer += delta
+			if _js_poll_timer >= _JS_POLL_INTERVAL:
+				_js_poll_timer = 0.0
+				var js = Engine.get_singleton("JavaScriptBridge")
+				if js:
+					js.eval("window.__mohaaServerState = %d;" % server_state)
+					js.eval("window.__mohaaCurrentMap = %s;" % JSON.stringify(current_map))
+					js.eval("window.__mohaaEngineInit = true;")
 
 		status_log_timer += delta
 		if status_log_timer >= 5.0:

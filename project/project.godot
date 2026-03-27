@@ -30,6 +30,11 @@ MapDownloader="*res://autoloads/MapDownloader.gd"
 
 window/size/viewport_width=1024
 window/size/viewport_height=768
+window/vsync/vsync_mode=0
+
+[editor]
+
+movie_writer/disable_vsync=true
 
 [input]
 
@@ -58,5 +63,12 @@ toggle_fullscreen={
 
 [rendering]
 
+textures/canvas_textures/default_texture_filter=2
+renderer/rendering_method="gl_compatibility"
 textures/vram_compression/import_etc2_astc=true
+lights_and_shadows/directional_shadow/soft_shadow_filter_quality=0
+lights_and_shadows/positional_shadow/soft_shadow_filter_quality=0
+lights_and_shadows/directional_shadow/size=1024
+lights_and_shadows/positional_shadow/atlas_size=1024
 anti_aliasing/quality/msaa_3d=0
+environment/defaults/default_clear_color=Color(0, 0, 0, 1)
