@@ -86,7 +86,8 @@ func find_cached_file_by_name(map_name: String) -> String:
 		var entry: Dictionary = _registry[hash_key]
 		var orig_name: String = entry.get("original_name", "")
 		var name_lower := orig_name.to_lower().trim_suffix(".pk3").trim_suffix(".zip")
-		if name_lower == search_lower or name_lower.ends_with(search_lower):
+		# Exact match only — ends_with could false-positive on partial names.
+		if name_lower == search_lower:
 			return hash_key
 	return ""
 
@@ -104,6 +105,9 @@ func install_to_game_dir(sha256_hex: String, game_dir: String) -> bool:
 	var original_name := get_original_name(key)
 	if original_name == "":
 		original_name = key + ".pk3"
+
+	# Sanitise filename to prevent path traversal from malicious API responses.
+	original_name = _sanitize_filename(original_name)
 
 	# Ensure game_dir ends with /
 	if not game_dir.ends_with("/"):
@@ -270,3 +274,16 @@ func _human_size(bytes: int) -> String:
 	if bytes < 1048576:
 		return "%.1f KB" % (bytes / 1024.0)
 	return "%.1f MB" % (bytes / 1048576.0)
+
+
+## Sanitise a filename to prevent path traversal attacks.
+## Strips directory components (../, /, \) from filenames that come from
+## external sources (API responses, server-provided file lists).
+static func _sanitize_filename(name: String) -> String:
+	# Use only the final component — strip any directory path.
+	var sanitized := name.get_file()
+	# Remove any remaining traversal sequences.
+	sanitized = sanitized.replace("..", "").replace("/", "").replace("\\", "")
+	if sanitized.strip_edges() == "" or sanitized == ".pk3":
+		sanitized = "unknown.pk3"
+	return sanitized
