@@ -156,6 +156,10 @@ var _detail_label: Label = null
 var _disconnect_btn: Button = null
 
 
+# Cached autoload references (resolved once in _ready).
+var _cache_manager: Node = null
+var _session_manager: Node = null
+
 func _ready() -> void:
 	# Load API key from project settings if available.
 	if ProjectSettings.has_setting("map_downloader/api_key"):
@@ -174,21 +178,29 @@ func _ready() -> void:
 	add_child(_http_download)
 	_http_download.request_completed.connect(_on_download_completed)
 
+	# Cache autoload references to avoid per-call get_node_or_null.
+	_cache_manager = get_node_or_null("/root/CacheManager")
+	_session_manager = get_node_or_null("/root/ServerSessionManager")
+
 	_build_overlay_ui()
 	_hide_ui()
 
+	# Disable per-frame processing until needed (download in progress).
+	set_process(false)
+	# Use a deferred call to attempt initial runner connection.
+	call_deferred("_try_connect_runner")
+
 
 func _process(delta: float) -> void:
-	# Lazily discover the MoHAARunner once it is added to the tree.
-	if not _runner_connected:
-		_try_connect_runner()
-
-	# Update download progress bar.
+	# Update download progress bar (only runs when _downloading is true).
 	if _downloading:
 		_progress_timer += delta
 		if _progress_timer >= PROGRESS_INTERVAL:
 			_progress_timer = 0.0
 			_update_download_progress()
+	else:
+		# Nothing to poll — disable per-frame processing.
+		set_process(false)
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +208,16 @@ func _process(delta: float) -> void:
 # ---------------------------------------------------------------------------
 
 func _try_connect_runner() -> void:
-	# Search the tree for the MoHAARunner node — avoids hard-coding a path.
+	# Search the tree for nodes in the "mohaa_runner" group first (O(1)),
+	# falling back to a shallow tree scan if the group is not set.
+	var runners := get_tree().get_nodes_in_group("mohaa_runner")
+	if runners.size() > 0:
+		_runner = runners[0]
+		_runner_connected = true
+		_runner.engine_error.connect(_on_engine_error)
+		print("MapDownloader: Connected to MoHAARunner engine_error signal.")
+		return
+	# Fallback: shallow tree scan (two levels deep).
 	var root := get_tree().root
 	for child in root.get_children():
 		for grandchild in child.get_children():
@@ -206,6 +227,8 @@ func _try_connect_runner() -> void:
 				_runner.engine_error.connect(_on_engine_error)
 				print("MapDownloader: Connected to MoHAARunner engine_error signal.")
 				return
+	# Not found yet — retry on next frame.
+	call_deferred("_try_connect_runner")
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +280,7 @@ func _on_engine_error(message: String) -> void:
 
 ## Ensure a ServerSessionManager session is active for the current server.
 func _ensure_server_session() -> void:
-	var session_mgr: Node = get_node_or_null("/root/ServerSessionManager")
+	var session_mgr: Node = _session_manager
 	if session_mgr == null:
 		return
 	if session_mgr.is_session_active():
@@ -293,8 +316,8 @@ func _detect_server_address() -> String:
 ## Check if the map is already in the shared cache (downloaded for any server).
 ## If found, install it for the current session and reconnect — no download needed.
 func _try_install_from_cache(map_name: String) -> bool:
-	var cache: Node = get_node_or_null("/root/CacheManager")
-	var session_mgr: Node = get_node_or_null("/root/ServerSessionManager")
+	var cache: Node = _cache_manager
+	var session_mgr: Node = _session_manager
 	if cache == null:
 		return false
 
@@ -477,6 +500,7 @@ func _on_search_completed(result: int, response_code: int,
 
 func _begin_download(url: String, file_name: String, file_size: int, file_hash: String) -> void:
 	_downloading = true
+	set_process(true)  # Enable per-frame progress polling.
 	_download_retry_count = 0
 	_progress_timer = 0.0
 
@@ -486,7 +510,7 @@ func _begin_download(url: String, file_name: String, file_size: int, file_hash: 
 	set_meta("dl_file_hash", file_hash)
 	set_meta("dl_url", url)
 
-	var cache: Node = get_node_or_null("/root/CacheManager")
+	var cache: Node = _cache_manager
 	if cache == null:
 		_fail("CacheManager autoload not found")
 		return
@@ -529,6 +553,7 @@ func _on_download_completed(result: int, response_code: int,
 			var retry_url: String = get_meta("dl_url", "")
 			if retry_url != "":
 				_downloading = true
+				set_process(true)  # Enable per-frame progress polling.
 				_download_path = "user://cache/_downloading.tmp"
 				_http_download.download_file = _download_path
 				var backoff := pow(2.0, _download_retry_count)  # 2s, 4s, …
@@ -567,7 +592,7 @@ func _on_download_completed(result: int, response_code: int,
 		return
 
 	# Move temp file to cache under its hash name.
-	var cache: Node = get_node_or_null("/root/CacheManager")
+	var cache: Node = _cache_manager
 	if cache == null:
 		_cleanup_temp()
 		_fail("CacheManager not available")
@@ -592,7 +617,7 @@ func _on_download_completed(result: int, response_code: int,
 	cache.register_file(actual_hash, file_name, file_size)
 
 	# UT-style: associate the downloaded file with the current server session.
-	var session_mgr: Node = get_node_or_null("/root/ServerSessionManager")
+	var session_mgr: Node = _session_manager
 	if session_mgr and session_mgr.is_session_active():
 		# Maps detected from "Couldn't load" errors are TYPE_MAP (universal).
 		session_mgr.associate_file(actual_hash, file_name, ServerSessionManager.TYPE_MAP)
@@ -606,13 +631,13 @@ func _on_download_completed(result: int, response_code: int,
 # ---------------------------------------------------------------------------
 
 func _install_and_reconnect(file_hash: String) -> void:
-	var cache: Node = get_node_or_null("/root/CacheManager")
+	var cache: Node = _cache_manager
 	if cache == null:
 		_fail("CacheManager not available for install")
 		return
 
 	# Try ServerSessionManager first (UT-style: tracks per-server associations).
-	var session_mgr: Node = get_node_or_null("/root/ServerSessionManager")
+	var session_mgr: Node = _session_manager
 	if session_mgr and session_mgr.is_session_active():
 		var file_name: String = cache.get_original_name(file_hash)
 		if file_name == "":
@@ -718,7 +743,7 @@ func _cleanup_temp() -> void:
 
 func _build_overlay_ui() -> void:
 	_overlay = CanvasLayer.new()
-	_overlay.layer = 100  # on top of everything
+	_overlay.layer = 200  # above engine HUD layer (100) and screen-effects layer (150)
 	add_child(_overlay)
 
 	# Semi-transparent background.
@@ -849,7 +874,7 @@ func _on_disconnect_pressed() -> void:
 		_runner.execute_command("disconnect")
 		print("MapDownloader: User disconnected from server.")
 	# End the server session so files are cleaned up.
-	var session_mgr: Node = get_node_or_null("/root/ServerSessionManager")
+	var session_mgr: Node = _session_manager
 	if session_mgr and session_mgr.is_session_active():
 		session_mgr.end_session()
 

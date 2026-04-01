@@ -364,9 +364,10 @@ func _process(delta):
 		status_log_timer += delta
 		if status_log_timer >= 5.0:
 			status_log_timer = 0.0
-			print("Main: Status state=", runner.get_server_state_string(),
-				" map=", current_map,
-				" players=", runner.get_player_count())
+			if OS.is_debug_build():
+				print("Main: Status state=", runner.get_server_state_string(),
+					" map=", current_map,
+					" players=", runner.get_player_count())
 
 func take_screenshot(label: String):
 	if OS.has_feature("headless") or DisplayServer.get_name() == "headless":

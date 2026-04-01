@@ -78,16 +78,14 @@ var _runner_connected: bool = false
 func _ready() -> void:
 	_ensure_dirs()
 	_load_registry()
+	# Disable per-frame processing; runner discovery uses deferred calls.
+	set_process(false)
+	call_deferred("_try_connect_runner")
 
 
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_PREDELETE:
 		_save_registry()
-
-
-func _process(_delta: float) -> void:
-	if not _runner_connected:
-		_try_connect_runner()
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +269,18 @@ func install_file_for_session(sha256_hex: String, file_name: String, content_typ
 # ---------------------------------------------------------------------------
 
 func _try_connect_runner() -> void:
+	# Search the tree for nodes in the "mohaa_runner" group first (O(1)),
+	# falling back to a shallow tree scan if the group is not set.
+	var runners := get_tree().get_nodes_in_group("mohaa_runner")
+	if runners.size() > 0:
+		_runner = runners[0]
+		_runner_connected = true
+		_runner.map_loaded.connect(_on_map_loaded)
+		if _runner.has_signal("map_unloaded"):
+			_runner.map_unloaded.connect(_on_map_unloaded)
+		print("ServerSessionManager: Connected to MoHAARunner.")
+		return
+	# Fallback: shallow tree scan.
 	var root := get_tree().root
 	for child in root.get_children():
 		for grandchild in child.get_children():
@@ -282,6 +292,8 @@ func _try_connect_runner() -> void:
 					_runner.map_unloaded.connect(_on_map_unloaded)
 				print("ServerSessionManager: Connected to MoHAARunner.")
 				return
+	# Not found yet — retry on next frame.
+	call_deferred("_try_connect_runner")
 
 
 func _on_map_loaded(_map_name: String) -> void:

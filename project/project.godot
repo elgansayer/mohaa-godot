@@ -16,7 +16,7 @@ compatibility/default_parent_skeleton_in_mesh_instance_3d=true
 
 config/name="MoHAA Godot"
 run/main_scene="res://Main.tscn"
-config/features=PackedStringArray("4.6", "Forward Plus")
+config/features=PackedStringArray("4.6", "GL Compatibility")
 boot_splash/image="uid://xe0fy6r8mulk"
 config/icon="res://icon.svg"
 
@@ -31,6 +31,8 @@ MapDownloader="*res://autoloads/MapDownloader.gd"
 window/size/viewport_width=1024
 window/size/viewport_height=768
 window/vsync/vsync_mode=0
+window/stretch/mode="viewport"
+window/stretch/aspect="expand"
 
 [editor]
 
@@ -72,3 +74,7 @@ lights_and_shadows/directional_shadow/size=1024
 lights_and_shadows/positional_shadow/atlas_size=1024
 anti_aliasing/quality/msaa_3d=0
 environment/defaults/default_clear_color=Color(0, 0, 0, 1)
+
+[physics]
+
+common/physics_fps=30
