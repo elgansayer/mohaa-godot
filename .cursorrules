@@ -1,0 +1,19 @@
+# OpenMoHAA Godot AI Factory Rules
+
+## Project Context
+This repository (mohaa-godot) is a Godot 4 GDExtension that ports the OpenMoHAA engine into Godot. The OpenMoHAA engine provides the game logic, networking, and script behavior, while Godot acts as the host runtime and handles the scene integration and export pipeline.
+
+## Build System
+- Prefer using `build.sh` or `cmake` (with presets like `linux-debug-engine`) for orchestration.
+- The engine uses `SCons` internally (`openmohaa/SConstruct`).
+- The Python scripts in `scripts/web_assets/` handle WebAssembly specific HTML/JS patching.
+
+## Language and Formatting
+- C++ (Engine/GDExtension): Use modern C++ practices. Avoid throwing exceptions across the C ABI where possible.
+- Bash (`build.sh`, `scripts/*.sh`): Make sure scripts are POSIX compliant or bash-safe, especially considering Windows MSYS2 workflows.
+- Python (`scripts/web_assets/*.py`): Used for template replacement, no inline heredocs.
+
+## AI Instructions
+1. Always search `README.md` first before diagnosing build issues, as the platform matrix and prerequisites are very strict.
+2. Web patches must be done inside `scripts/web_assets/templates` or `js/` instead of hardcoding strings in Python.
+3. Keep C++ GDExtension boundaries clean between Godot nodes and OpenMoHAA systems.
